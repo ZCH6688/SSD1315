@@ -14,6 +14,7 @@
 #define SSD1315_HEIGHT         64
 #define SSD1315_PAGE_NUM       (SSD1315_HEIGHT / 8)
 #define SSD1315_PAGE_SIZE      SSD1315_WIDTH
+#define SSD1315_FB_SIZE        (SSD1315_WIDTH * SSD1315_HEIGHT / 8)
 
 /* I2C 控制字节 */
 #define SSD1315_CMD_CTRL       0x00
@@ -25,8 +26,14 @@
 struct ssd1315_device {
     struct i2c_client *client;
 
+    /* OLED 软件显存 */
+    u8 framebuffer[SSD1315_FB_SIZE];
+
+    /* 并发放问保护 */
     struct mutex lock;
 };
+
+
 
 /*
  * 向 SSD1315 发送命令
@@ -187,6 +194,83 @@ static int ssd1315_fill(struct ssd1315_device *oled, u8 value)
     return 0;
 }
 
+/* 修改指定像素 
+ *
+ * 注意调用者必须持有mutex
+ * 
+ * x:横坐标，范围0～127
+ * y:纵坐标，范围0～63
+ * color: 1表示点亮，0表示熄灭
+*/
+static void ssd1315_draw_point_locked(struct ssd1315_device *oled, u8 x, u8 y, u8 color)
+{
+    u16 offset;
+    u8 mask;
+
+    /* 计算现存偏移 */
+    offset = (y / 8) * SSD1315_WIDTH + x;
+
+    mask = (u8)(1 << (y % 8));
+
+
+    if(color)
+        oled->framebuffer[offset] |= mask;
+    else
+        oled->framebuffer[offset] &= ~mask;
+}
+
+/*
+ * 将软件显存刷新到 SSD1315
+ *
+ * 注意：调用者必须持有 oled->lock
+ *
+*/
+static int ssd1315_refresh_locked(struct ssd1315_device *oled)
+{
+    int ret;
+    u8 page;
+    size_t offset;
+
+    for(page = 0; page < SSD1315_PAGE_NUM; page++)
+    {
+        /* 计算当前 page 在 framebuffer 中的偏移 */
+        offset = page * SSD1315_WIDTH;
+
+        /* 设置当前 Page 在 framebuffer 中的偏移*/
+        ret = ssd1315_set_page(oled, page);
+        if(ret < 0)
+            return ret;
+        ret = ssd1315_write_data(oled, &oled->framebuffer[offset], SSD1315_PAGE_SIZE);
+        if(ret < 0)
+            return ret;
+
+    }
+
+    return 0;
+}
+
+/*
+ * 清空软件显存
+ *
+ * 注意：调用者必须持有 oled->lock。
+ */
+static void ssd1315_fb_clear_locked(struct ssd1315_device *oled)
+{
+    memset(oled->framebuffer, 0, sizeof(oled->framebuffer));
+}
+
+/*
+ * 清空 framebuffer，并刷新 OLED
+ *
+ * 注意：调用者必须持有 oled->lock。
+ */
+static int ssd1315_clear_locked(struct ssd1315_device *oled)
+{
+    ssd1315_fb_clear_locked(oled);
+
+    return ssd1315_refresh_locked(oled);
+}
+
 /*
  * SSD1315 初始化
  */
@@ -247,9 +331,9 @@ static int ssd1315_init(struct ssd1315_device *oled)
         goto out;
 
     /* 清空显存 */
-    ret = ssd1315_fill(oled, 0xFF);
+    ret = ssd1315_clear_locked(oled);
     if (ret < 0)
-        goto out;
+        goto out;   
 
     /* 打开显示 */
     ret = ssd1315_write_cmds(oled,
@@ -257,6 +341,52 @@ static int ssd1315_init(struct ssd1315_device *oled)
                              1);
 
 out:
+    mutex_unlock(&oled->lock);
+
+    return ret;
+}
+
+/*
+ * 测试 framebuffer
+ *
+ * 显示矩形边框和一条对角线。
+ */
+static int ssd1315_test_pattern(struct ssd1315_device *oled)
+{
+    int x;
+    int y;
+    int ret = 0;
+
+    mutex_lock(&oled->lock);
+
+    /* 清空软件显存 */
+    ssd1315_fb_clear_locked(oled);
+
+    /* 绘制矩形上边和下边 */
+    for (x = 8; x < 120; x++) {
+
+        ssd1315_draw_point_locked(oled, x, 8, 1);
+
+        ssd1315_draw_point_locked(oled, x, 55, 1);
+    }
+
+    /* 绘制矩形左边和右边 */
+    for (y = 8; y < 56; y++) {
+
+        ssd1315_draw_point_locked(oled, 8, y, 1);
+
+        ssd1315_draw_point_locked(oled, 119, y, 1);
+    }
+
+    /* 绘制对角线 */
+    for (x = 0; x < 64; x++) {
+
+        ssd1315_draw_point_locked(oled, x * 2, x, 1);
+    }
+
+    /* 将测试图案刷新到 OLED */
+    ret = ssd1315_refresh_locked(oled);
+
     mutex_unlock(&oled->lock);
 
     return ret;
@@ -308,6 +438,16 @@ static int ssd1315_probe(struct i2c_client *client,
 
         return ret;
     }
+
+    ret = ssd1315_test_pattern(oled);
+
+    if (ret < 0) {
+         dev_err(&client->dev,
+                 "Framebuffer test failed: %d\n",
+                 ret);
+    return ret;
+    }
+
 
     dev_info(&client->dev,
              "SSD1315 initialized: addr=0x%02x\n",

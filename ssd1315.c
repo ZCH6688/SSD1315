@@ -7,6 +7,8 @@
 #include <linux/mutex.h>
 #include <linux/errno.h>
 #include <linux/string.h>
+#include "ssd1315_font.h"
+
 
 
 /* OLED 参数 */
@@ -22,6 +24,7 @@
 
 /* 每次发送的显示数据长度 */
 #define SSD1315_I2C_CHUNK      16
+
 
 struct ssd1315_device {
     struct i2c_client *client;
@@ -220,6 +223,288 @@ static void ssd1315_draw_point_locked(struct ssd1315_device *oled, u8 x, u8 y, u
 }
 
 /*
+ * 绘制直线
+ *
+ * 使用 Bresenham 算法。
+ *
+ * 注意：调用者必须持有 oled->lock。
+ */
+static int ssd1315_draw_line_locked(struct ssd1315_device *oled,
+                                    int x0, int y0,
+                                    int x1, int y1,
+                                    int color)
+{
+    int dx, dy;
+    int sx, sy;
+    int err, e2;
+
+    /* 检查坐标范围 */
+    if (x0 < 0 || x0 >= SSD1315_WIDTH ||
+        x1 < 0 || x1 >= SSD1315_WIDTH ||
+        y0 < 0 || y0 >= SSD1315_HEIGHT ||
+        y1 < 0 || y1 >= SSD1315_HEIGHT)
+        return -EINVAL;
+
+    dx = abs(x1 - x0);
+    dy = -abs(y1 - y0);
+
+    sx = x0 < x1 ? 1 : -1;
+    sy = y0 < y1 ? 1 : -1;
+
+    err = dx + dy;
+
+    while (1) {
+
+        /* 绘制当前像素 */
+        ssd1315_draw_point_locked(oled,
+                                  x0, y0,
+                                  color);
+
+        if (x0 == x1 && y0 == y1)
+            break;
+
+        e2 = 2 * err;
+
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * 绘制空心矩形
+ *
+ * 注意：调用者必须持有 oled->lock。
+ */
+static int ssd1315_draw_rect_locked(struct ssd1315_device *oled,
+                                    int x0, int y0,
+                                    int x1, int y1,
+                                    int color)
+{
+    int ret;
+
+    if (x0 < 0 || x0 >= SSD1315_WIDTH ||
+        x1 < 0 || x1 >= SSD1315_WIDTH ||
+        y0 < 0 || y0 >= SSD1315_HEIGHT ||
+        y1 < 0 || y1 >= SSD1315_HEIGHT ||
+        x0 > x1 || y0 > y1)
+        return -EINVAL;
+
+    /* 上边 */
+    ret = ssd1315_draw_line_locked(oled,
+                                   x0, y0,
+                                   x1, y0,
+                                   color);
+    if (ret < 0)
+        return ret;
+
+    /* 下边 */
+    ret = ssd1315_draw_line_locked(oled,
+                                   x0, y1,
+                                   x1, y1,
+                                   color);
+    if (ret < 0)
+        return ret;
+
+    /* 左边 */
+    ret = ssd1315_draw_line_locked(oled,
+                                   x0, y0,
+                                   x0, y1,
+                                   color);
+    if (ret < 0)
+        return ret;
+
+    /* 右边 */
+    ret = ssd1315_draw_line_locked(oled,
+                                   x1, y0,
+                                   x1, y1,
+                                   color);
+
+    return ret;
+}
+
+/*
+ * 绘制实心矩形
+ *
+ * 注意：调用者必须持有 oled->lock。
+ */
+static int ssd1315_fill_rect_locked(struct ssd1315_device *oled,
+                                    int x0, int y0,
+                                    int x1, int y1,
+                                    int color)
+{
+    int x, y;
+
+    if (x0 < 0 || x0 >= SSD1315_WIDTH ||
+        x1 < 0 || x1 >= SSD1315_WIDTH ||
+        y0 < 0 || y0 >= SSD1315_HEIGHT ||
+        y1 < 0 || y1 >= SSD1315_HEIGHT ||
+        x0 > x1 || y0 > y1)
+        return -EINVAL;
+
+    for (y = y0; y <= y1; y++) {
+        for (x = x0; x <= x1; x++) {
+
+            ssd1315_draw_point_locked(oled,
+                                      x, y,
+                                      color);
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * 显示一个 ASCII 字符
+ *
+ * x、y：字符左上角坐标
+ * fg：前景色，1 点亮，0 熄灭
+ * bg：背景色，1 点亮，0 熄灭
+ *
+ * 字符占用 6x8 像素：
+ * 5x7 字模 + 1列字符间距 + 1行底部间距。
+ *
+ * 注意：调用者必须持有 oled->lock。
+ */
+static int ssd1315_draw_char_locked(struct ssd1315_device *oled,
+                                    unsigned int x,
+                                    unsigned int y,
+                                    unsigned char ch,
+                                    int fg,
+                                    int bg)
+{
+    const u8 *glyph;
+    unsigned int col;
+    unsigned int row;
+
+    /* 检查字符显示区域是否越界 */
+    if (x > SSD1315_WIDTH - 6 ||
+        y > SSD1315_HEIGHT - 8)
+        return -EINVAL;
+
+    /* 不支持的字符统一显示为 '?' */
+    if (ch < 0x20 || ch > 0x7E)
+        ch = '?';
+
+    glyph = ssd1315_font5x7[ch - 0x20];
+
+    /*
+     * 先绘制完整字符背景。
+     * 这样不会留下上一次显示的残留像素。
+     */
+    ssd1315_fill_rect_locked(oled,
+                             x, y,
+                             x + 5, y + 7,
+                             bg);
+
+    /* 绘制 5x7 字模 */
+    for (col = 0; col < 5; col++) {
+
+        for (row = 0; row < 7; row++) {
+
+            if (glyph[col] & (1U << row)) {
+
+                ssd1315_draw_point_locked(oled,
+                                          x + col,
+                                          y + row,
+                                          fg);
+            }
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * 显示 ASCII 字符串
+ *
+ * x、y：字符串起始坐标
+ * fg：前景色
+ * bg：背景色
+ *
+ * 支持：
+ * 1. 自动换行
+ * 2. '\n' 换行
+ * 3. '\r' 忽略
+ *
+ * 注意：调用者必须持有 oled->lock。
+ */
+static int ssd1315_draw_string_locked(struct ssd1315_device *oled,
+                                      unsigned int x,
+                                      unsigned int y,
+                                      const char *str,
+                                      int fg,
+                                      int bg)
+{
+    unsigned int cursor_x = x;
+    unsigned int cursor_y = y;
+    unsigned char ch;
+    int ret;
+
+    if (!str)
+        return -EINVAL;
+
+    if (x > SSD1315_WIDTH - 6 ||
+        y > SSD1315_HEIGHT - 8)
+        return -EINVAL;
+
+    while (*str) {
+
+        ch = (unsigned char)*str++;
+
+        /* 忽略回车 */
+        if (ch == '\r')
+            continue;
+
+        /* 处理换行 */
+        if (ch == '\n') {
+
+            cursor_x = x;
+            cursor_y += 8;
+
+            if (cursor_y > SSD1315_HEIGHT - 8)
+                break;
+
+            continue;
+        }
+
+        /* 当前行空间不足，自动换行 */
+        if (cursor_x > SSD1315_WIDTH - 6) {
+
+            cursor_x = x;
+            cursor_y += 8;
+        }
+
+        /* 屏幕空间不足，停止显示 */
+        if (cursor_y > SSD1315_HEIGHT - 8)
+            break;
+
+        ret = ssd1315_draw_char_locked(oled,
+                                       cursor_x,
+                                       cursor_y,
+                                       ch,
+                                       fg,
+                                       bg);
+
+        if (ret < 0)
+            return ret;
+
+        /* 下一个字符向右移动 6 个像素 */
+        cursor_x += 6;
+    }
+
+    return 0;
+}
+
+/*
  * 将软件显存刷新到 SSD1315
  *
  * 注意：调用者必须持有 oled->lock
@@ -351,46 +636,68 @@ out:
  *
  * 显示矩形边框和一条对角线。
  */
+/*
+ * V3.0 图形与字符显示测试
+ */
 static int ssd1315_test_pattern(struct ssd1315_device *oled)
 {
-    int x;
-    int y;
-    int ret = 0;
+    int ret;
 
     mutex_lock(&oled->lock);
 
     /* 清空软件显存 */
     ssd1315_fb_clear_locked(oled);
 
-    /* 绘制矩形上边和下边 */
-    for (x = 8; x < 120; x++) {
+    /* 绘制屏幕边框 */
+    ret = ssd1315_draw_rect_locked(oled,
+                                   0, 0,
+                                   127, 63,
+                                   1);
+    if (ret < 0)
+        goto out;
 
-        ssd1315_draw_point_locked(oled, x, 8, 1);
+    /* 显示第一行字符串 */
+    ret = ssd1315_draw_string_locked(oled,
+                                     6, 8,
+                                     "Hello Linux!",
+                                     1, 0);
+    if (ret < 0)
+        goto out;
 
-        ssd1315_draw_point_locked(oled, x, 55, 1);
-    }
+    /* 显示第二行字符串 */
+    ret = ssd1315_draw_string_locked(oled,
+                                     6, 24,
+                                     "SSD1315 OLED",
+                                     1, 0);
+    if (ret < 0)
+        goto out;
 
-    /* 绘制矩形左边和右边 */
-    for (y = 8; y < 56; y++) {
+    /* 显示第三行字符串 */
+    ret = ssd1315_draw_string_locked(oled,
+                                     6, 40,
+                                     "i.MX6ULL",
+                                     1, 0);
+    if (ret < 0)
+        goto out;
 
-        ssd1315_draw_point_locked(oled, 8, y, 1);
+    /* 绘制底部横线 */
+    ret = ssd1315_draw_line_locked(oled,
+                                   6, 54,
+                                   121, 54,
+                                   1);
+    if (ret < 0)
+        goto out;
 
-        ssd1315_draw_point_locked(oled, 119, y, 1);
-    }
-
-    /* 绘制对角线 */
-    for (x = 0; x < 64; x++) {
-
-        ssd1315_draw_point_locked(oled, x * 2, x, 1);
-    }
-
-    /* 将测试图案刷新到 OLED */
+    /* 刷新 OLED */
     ret = ssd1315_refresh_locked(oled);
 
+out:
     mutex_unlock(&oled->lock);
 
     return ret;
 }
+
+
 
 /*
  * I2C 设备 probe
@@ -438,7 +745,6 @@ static int ssd1315_probe(struct i2c_client *client,
 
         return ret;
     }
-
     ret = ssd1315_test_pattern(oled);
 
     if (ret < 0) {
